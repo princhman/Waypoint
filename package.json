@@ -1,7 +1,7 @@
 {
-	"name": "waypoint",
-	"version": "3.0.1",
-	"description": "Easily generate dynamic content maps in your folder notes using waypoints. Enables folders to show up in the graph view and removes the need for messy tags!",
+	"name": "folder-toc",
+	"version": "4.0.0",
+	"description": "Generate dynamic folder tables of contents with file headings, subfolders, and PDF support using code blocks.",
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",

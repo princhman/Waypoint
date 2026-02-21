@@ -1,0 +1,22 @@
+.folder-toc-refresh {
+	display: block;
+	margin-top: 8px;
+	cursor: pointer;
+	opacity: 0.4;
+	background: none;
+	border: none;
+	font-size: 13px;
+	padding: 2px 8px;
+	border-radius: 4px;
+	color: var(--text-muted);
+}
+
+.folder-toc-refresh:hover {
+	opacity: 1;
+	background: var(--background-modifier-hover);
+}
+
+.folder-toc-error {
+	color: var(--text-error);
+	font-style: italic;
+}

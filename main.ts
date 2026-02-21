@@ -1,552 +1,441 @@
-import { App, debounce, normalizePath, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder, TextComponent, ToggleComponent } from "obsidian";
+import { App, MarkdownRenderChild, MarkdownPostProcessorContext, parseYaml, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, TFolder } from "obsidian";
+
+const BEGIN_MARKER = "%% Begin Folder TOC %%";
+const END_MARKER = "%% End Folder TOC %%";
 
 enum FolderNoteType {
 	InsideFolder = "INSIDE_FOLDER",
 	OutsideFolder = "OUTSIDE_FOLDER",
-	CustomFilename = "CUSTOM_FILENAME"
+	CustomFilename = "CUSTOM_FILENAME",
 }
 
-interface WaypointSettings {
-	waypointFlag: string
-	stopScanAtFolderNotes: boolean,
-	showFolderNotes: boolean,
-	showNonMarkdownFiles: boolean,
-	debugLogging: boolean,
-	useWikiLinks: boolean,
-	showEnclosingNote: boolean,
-	folderNoteType: string,
-	folderNoteFilename: string
-
-}
-
-enum WaypointType {
-	Waypoint = "waypoint",
-	Landmark = "landmark",
-}
-
-interface WaypointSettings {
-	waypointFlag: string;
-	landmarkFlag: string;
-	stopScanAtFolderNotes: boolean;
-	showFolderNotes: boolean;
-	showNonMarkdownFiles: boolean;
-	foldersOnTop: boolean;
-	debugLogging: boolean;
+interface FolderTocSettings {
 	useWikiLinks: boolean;
 	useFrontMatterTitle: boolean;
-	showEnclosingNote: boolean;
-	folderNoteType: string;
-	ignorePaths: string[];
-	useSpaces: boolean;
-	numSpaces: number;
+	foldersOnTop: boolean;
+	includePdf: boolean;
+	folderNoteType: FolderNoteType;
+	folderNoteFilename: string;
 }
 
-const DEFAULT_SETTINGS: WaypointSettings = {
-	waypointFlag: "%% Waypoint %%",
-	landmarkFlag: "%% Landmark %%",
-	stopScanAtFolderNotes: false,
-	showFolderNotes: false,
-	showNonMarkdownFiles: false,
-	foldersOnTop: true,
-	debugLogging: false,
+const DEFAULT_SETTINGS: FolderTocSettings = {
 	useWikiLinks: true,
 	useFrontMatterTitle: false,
-	showEnclosingNote: false,
+	foldersOnTop: true,
+	includePdf: false,
 	folderNoteType: FolderNoteType.InsideFolder,
 	folderNoteFilename: "index",
-	ignorePaths: ["_attachments"],
-	useSpaces: false,
-	numSpaces: 2,
 };
 
-export default class Waypoint extends Plugin {
-	static readonly BEGIN_WAYPOINT = "%% Begin Waypoint %%";
-	static readonly END_WAYPOINT = "%% End Waypoint %%";
-	static readonly BEGIN_LANDMARK = "%% Begin Landmark %%";
-	static readonly END_LANDMARK = "%% End Landmark %%";
+interface FolderTocConfig {
+	path?: string;
+	headingDepth: number;
+	includePdf: boolean;
+	ignore: string[];
+}
 
-	foldersWithChanges = new Set<TFolder>();
-	settings: WaypointSettings;
+interface HeadingNode {
+	text: string;
+	level: number;
+	children: HeadingNode[];
+}
 
-	async onload() {
-		await this.loadSettings();
-		this.addCommand({
-			id: "go_to_parent_waypoint",
-			name: "Go to parent Waypoint",
-			callback: async () => {
-				const curFile = this.app.workspace.getActiveFile();
-				let folder = curFile.parent;
-				if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-					folder = folder?.parent;
-				}
-				const [, parentPoint] = await this.locateParentPoint(folder, FolderNoteType.InsideFolder === this.settings.folderNoteType);
-				this.app.workspace.activeLeaf.openFile(parentPoint);
-			},
-		});
-		this.app.workspace.onLayoutReady(async () => {
-			// Register events after layout is built to avoid initial wave of 'create' events
-			this.registerEvent(
-				this.app.vault.on("create", (file) => {
-					this.log("create " + file.name);
-					this.foldersWithChanges.add(file.parent);
-					this.scheduleUpdate();
-				})
-			);
-			this.registerEvent(
-				this.app.vault.on("delete", (file) => {
-					this.log("delete " + file.name);
-					const parentFolder = this.getParentFolder(file.path);
-					if (parentFolder !== null) {
-						this.foldersWithChanges.add(parentFolder);
-						this.scheduleUpdate();
-					}
-				})
-			);
-			this.registerEvent(
-				this.app.vault.on("rename", (file, oldPath) => {
-					this.log("rename " + file.name);
-					this.foldersWithChanges.add(file.parent);
-					const parentFolder = this.getParentFolder(oldPath);
-					if (parentFolder !== null) {
-						this.foldersWithChanges.add(parentFolder);
-					}
-					this.scheduleUpdate();
-				})
-			);
-			this.registerEvent(this.app.vault.on("modify", this.detectFlags));
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new WaypointSettingsTab(this.app, this));
+function parseConfig(source: string, settings?: FolderTocSettings): FolderTocConfig {
+	let parsed: Record<string, unknown> = {};
+	try {
+		const result = parseYaml(source);
+		if (result && typeof result === "object") {
+			parsed = result as Record<string, unknown>;
+		}
+	} catch {
+		// Empty or invalid YAML — use defaults
 	}
 
-	onunload() { }
+	const headingDepth = typeof parsed.headingDepth === "number" && parsed.headingDepth >= 1 && parsed.headingDepth <= 6 ? parsed.headingDepth : 3;
+	const includePdf = typeof parsed.includePdf === "boolean" ? parsed.includePdf : (settings?.includePdf ?? false);
 
-	detectFlags = async (file: TFile) => {
-		this.detectFlag(file, WaypointType.Waypoint);
-		this.detectFlag(file, WaypointType.Landmark);
+	let ignore: string[] = [];
+	if (Array.isArray(parsed.ignore)) {
+		ignore = parsed.ignore.filter((item): item is string => typeof item === "string");
+	}
+
+	return {
+		path: typeof parsed.path === "string" ? parsed.path : undefined,
+		headingDepth,
+		includePdf,
+		ignore,
 	};
+}
 
-	/**
-	 * Scan the given file for the waypoint flag. If found, update the waypoint.
-	 * @param file The file to scan
-	 */
-	detectFlag = async (file: TFile, flagType: WaypointType) => {
-		if (file && this.ignorePath(file.path)) {
-			return;
-		}
-		this.log("Modification on " + file.name);
-		this.log("Scanning for " + flagType + " flags...");
-		const waypointFlag = await this.getWaypointFlag(flagType);
-		const text = await this.app.vault.cachedRead(file);
-		const lines: string[] = text.split("\n");
-		for (let i = 0; i < lines.length; i++) {
-			if (lines[i].trim().includes(waypointFlag)) {
-				if (this.isFolderNote(file)) {
-					this.log("Found " + flagType + " flag in folder note!");
-					await this.updateWaypoint(file, flagType);
-					await this.updateParentPoint(file.parent, this.settings.folderNoteType === FolderNoteType.OutsideFolder);
-					return;
-				} else if (file.parent.isRoot()) {
-					this.log("Found " + flagType + " flag in root folder.");
-					this.printError(file, `%% Error: Cannot create a ` + flagType + ` in the root folder of your vault. For more information, check the instructions [here](https://github.com/IdreesInc/Waypoint) %%`, flagType);
-					return;
-				} else {
-					this.log("Found " + flagType + " flag in invalid note.");
-					this.printError(file, `%% Error: Cannot create a ` + flagType + ` in a note that's not the folder note. For more information, check the instructions [here](https://github.com/IdreesInc/Waypoint) %%`, flagType);
-					return;
-				}
-			}
-		}
-		this.log("No " + flagType + " flags found.");
-	};
+function buildHeadingTree(headings: { heading: string; level: number }[], maxDepth: number): HeadingNode[] {
+	const filtered = headings.filter((h) => h.level <= maxDepth);
+	const root: HeadingNode[] = [];
+	const stack: { node: HeadingNode; level: number }[] = [];
 
-	isFolderNote(file: TFile): boolean {
-		if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-			return file.basename == file.parent.name;
-		} else if (this.settings.folderNoteType === FolderNoteType.OutsideFolder) {
-			if (file.parent) {
-				return this.app.vault.getAbstractFileByPath(this.getCleanParentPath(file) + file.basename) instanceof TFolder;
-			}
-			return false;
-		} else if (this.settings.folderNoteType === FolderNoteType.CustomFilename) {
-			return file.basename == this.settings.folderNoteFilename;
-		}
-		return false;
-	}
+	for (const h of filtered) {
+		const node: HeadingNode = {
+			text: h.heading,
+			level: h.level,
+			children: [],
+		};
 
-	getCleanParentPath(node: TAbstractFile): string {
-		if (node.parent instanceof TFolder && node.parent.isRoot()) {
-			return "";
+		while (stack.length > 0 && stack[stack.length - 1].level >= h.level) {
+			stack.pop();
 		}
-		return node.parent.path + "/";
-	}
 
-	async printError(file: TFile, error: string, flagType: WaypointType) {
-		this.log("Creating " + flagType + " error in " + file.path);
-		const text = await this.app.vault.read(file);
-		const lines: string[] = text.split("\n");
-		let waypointIndex = -1;
-		const pointFlag = await this.getWaypointFlag(flagType);
-		for (let i = 0; i < lines.length; i++) {
-			const trimmed = lines[i].trim();
-			if (trimmed.includes(pointFlag)) {
-				waypointIndex = i;
-			}
-		}
-		if (waypointIndex === -1) {
-			console.error("Error: No " + flagType + " flag found while trying to print error.");
-			return;
-		}
-		lines.splice(waypointIndex, 1, error);
-		await this.app.vault.modify(file, lines.join("\n"));
-	}
-
-	/**
-	 * Get the string indices of the begin and end points for the given waypoint.
-	 */
-	async getWaypointBounds(flag: string): Promise<[string, string] | [null, null]> {
-		if (flag === WaypointType.Waypoint) {
-			return [Waypoint.BEGIN_WAYPOINT, Waypoint.END_WAYPOINT];
-		}
-		if (flag === WaypointType.Landmark) {
-			return [Waypoint.BEGIN_LANDMARK, Waypoint.END_LANDMARK];
-		}
-		return [null, null];
-	}
-
-	/**
-	 * Get the indicator for the given waypoint type.
-	 */
-	async getWaypointFlag(type: WaypointType): Promise<string> | null {
-		if (type === WaypointType.Waypoint) {
-			return this.settings.waypointFlag;
-		} else if (type === WaypointType.Landmark) {
-			return this.settings.landmarkFlag;
-		}
-		console.error("Error: Invalid waypoint type: " + type);
-		return null;
-	}
-
-	/**
-	 * Given a file with a waypoint flag, generate a file tree representation and update the waypoint text.
-	 * @param file The file to update
-	 */
-	async updateWaypoint(file: TFile, flagType: WaypointType) {
-		this.log("Updating " + flagType + " in " + file.path);
-		let fileTree;
-		if (this.settings.folderNoteType === FolderNoteType.InsideFolder || this.settings.folderNoteType === FolderNoteType.CustomFilename) {
-			fileTree = await this.getFileTreeRepresentation(file.parent, file.parent, 0, true);
+		if (stack.length === 0) {
+			root.push(node);
 		} else {
-			const folder = this.app.vault.getAbstractFileByPath(this.getCleanParentPath(file) + file.basename);
-			if (folder instanceof TFolder) {
-				fileTree = await this.getFileTreeRepresentation(file.parent, folder, 0, true);
-			}
+			stack[stack.length - 1].node.children.push(node);
 		}
-		const [beginWaypoint, endWaypoint] = await this.getWaypointBounds(flagType);
-		let waypoint = `${beginWaypoint}\n${fileTree}\n\n${endWaypoint}`;
-		if (beginWaypoint === null || endWaypoint === null) {
-			console.error("Error: Waypoint bounds not found, unable to continue.");
-			return;
-		}
-		const waypointFlag = await this.getWaypointFlag(flagType);
+
+		stack.push({ node, level: h.level });
+	}
+
+	return root;
+}
+
+class FolderTocRenderer extends MarkdownRenderChild {
+	private config: FolderTocConfig;
+
+	constructor(
+		containerEl: HTMLElement,
+		private source: string,
+		private app: App,
+		private plugin: FolderTocPlugin,
+		private sourcePath: string,
+		private ctx: MarkdownPostProcessorContext,
+	) {
+		super(containerEl);
+		this.config = parseConfig(source, plugin.settings);
+	}
+
+	onload() {
+		this.containerEl.empty();
+
+		const refreshBtn = this.containerEl.createEl("button", {
+			cls: "folder-toc-refresh",
+			attr: { "aria-label": "Refresh Folder TOC" },
+		});
+		refreshBtn.textContent = "↻ Refresh Folder TOC";
+		refreshBtn.addEventListener("click", (e: MouseEvent) => {
+			e.preventDefault();
+			this.updateFileContent();
+		});
+	}
+
+	private async updateFileContent() {
+		const file = this.app.vault.getAbstractFileByPath(this.sourcePath);
+		if (!(file instanceof TFile)) return;
+
+		const folder = this.resolveFolder();
+		if (!folder) return;
+
+		const tocContent = this.buildMarkdown(folder);
+		const newBlock = `${BEGIN_MARKER}\n${tocContent}\n${END_MARKER}`;
+
 		const text = await this.app.vault.read(file);
-		const lines: string[] = text.split("\n");
-		let waypointStart = -1;
-		let waypointEnd = -1;
-		let isCallout;
-		// Whether this is the first time we are creating the waypoint
-		let initialWaypoint = false;
-		for (let i = 0; i < lines.length; i++) {
+		const lines = text.split("\n");
+
+		// Find the code block that contains our config
+		const sectionInfo = this.ctx.getSectionInfo(this.containerEl);
+		if (!sectionInfo) return;
+
+		const codeBlockEnd = sectionInfo.lineEnd;
+
+		// Look for existing markers after the code block
+		let markerStart = -1;
+		let markerEnd = -1;
+		for (let i = codeBlockEnd + 1; i < lines.length; i++) {
 			const trimmed = lines[i].trim();
-			if (waypointStart === -1 && (trimmed.includes(waypointFlag) || trimmed.includes(beginWaypoint))) {
-				isCallout = trimmed.startsWith(">");
-				initialWaypoint = trimmed.includes(waypointFlag);
-				waypointStart = i;
-				continue;
+			if (markerStart === -1) {
+				// Skip blank lines between code block and marker
+				if (trimmed === "") continue;
+				if (trimmed === BEGIN_MARKER) {
+					markerStart = i;
+					continue;
+				}
+				break; // Non-blank, non-marker line — no existing TOC
 			}
-			if (waypointStart !== -1 && trimmed.includes(endWaypoint)) {
-				waypointEnd = i;
+			if (trimmed === END_MARKER) {
+				markerEnd = i;
 				break;
 			}
 		}
-		if (waypointStart === -1) {
-			console.error("Error: No " + flagType + " found while trying to update " + file.path);
-			return;
+
+		if (markerStart !== -1 && markerEnd !== -1) {
+			// Replace existing TOC
+			lines.splice(markerStart, markerEnd - markerStart + 1, newBlock);
+		} else {
+			// Insert new TOC after the code block
+			lines.splice(codeBlockEnd + 1, 0, "", newBlock);
 		}
-		this.log(flagType + " found at " + waypointStart + " to " + waypointEnd);
-		if (isCallout) {
-			if (initialWaypoint) {
-				// Add callout block prefix to the waypoint
-				const prefix = flagType === WaypointType.Landmark ? "[!landmark]\n" : "[!waypoint]\n";
-				waypoint = prefix + waypoint;
-			}
-			// Prefix each line with ">" to make it a callout
-			const waypointLines = waypoint.split("\n");
-			const updatedLines = waypointLines.map((line) => `>${line}`);
-			waypoint = updatedLines.join("\n");
-		}
-		lines.splice(waypointStart, waypointEnd !== -1 ? waypointEnd - waypointStart + 1 : 1, waypoint);
+
 		await this.app.vault.modify(file, lines.join("\n"));
 	}
 
-	private getTitleFromFrontMatter(file: TFile): string | undefined {
-		if (this.settings.useFrontMatterTitle) {
-			const fm = this.app.metadataCache?.getFileCache(file)?.frontmatter;
-			if (fm?.hasOwnProperty("title") && typeof fm.title === "string") {
-				this.log(`Found frontmatter title for ${file.path}: ${fm.title}`);
-				return fm.title
-			}
-		}
-		return undefined;
+	private buildMarkdown(folder: TFolder): string {
+		const lines: string[] = [];
+		lines.push(`**${folder.name}**`);
+		this.buildFolderLines(folder, lines, 0, true);
+		return lines.join("\n");
 	}
 
-	/**
-	 * Generate a file tree representation of the given folder.
-	 * @param rootNode The root of the file tree that will be generated
-	 * @param node The current node in our recursive descent
-	 * @param indentLevel How many levels of indentation to draw
-	 * @param topLevel Whether this is the top level of the tree or not
-	 * @returns The string representation of the tree, or null if the node is not a file or folder
-	 */
-	async getFileTreeRepresentation(rootNode: TFolder, node: TAbstractFile, indentLevel: number, topLevel = false): Promise<string> | null {
-		const indent = this.settings.useSpaces ? " ".repeat(this.settings.numSpaces) : "	";
-		const bullet = indent.repeat(indentLevel) + "-";
-		if (!(node instanceof TFile) && !(node instanceof TFolder)) {
-			return null;
-		}
-		this.log(node.path);
-		if (this.ignorePath(node.path)) {
-			return null;
-		}
-
-		if (node instanceof TFile) {
-			if (this.settings.debugLogging) {
-				console.log(node);
-			}
-			const fmTitle: string | undefined = this.getTitleFromFrontMatter(node);
-			// Print the file name
-			if (node.extension == "md" || node.extension == "base") {
-				const isBase = node.extension === "base";
-				if (this.settings.useWikiLinks) {
-					// Base links require the extension for some reason
-					const nodeName = isBase ? node.basename + ".base" : node.basename;
-					// Hide ".base" from the title if not otherwise specified
-					const title = isBase && !fmTitle ? node.basename : fmTitle;
-					if (title) {
-						return `${bullet} [[${nodeName}|${title}]]`;
-					} else {
-						return `${bullet} [[${nodeName}]]`;
-					}
-				}
-				if (fmTitle) {
-					return `${bullet} [${fmTitle}](${this.getEncodedUri(rootNode, node)})`;
-				} else {
-					return `${bullet} [${node.basename}](${this.getEncodedUri(rootNode, node)})`;
-				}
-			}
-			if (this.settings.showNonMarkdownFiles) {
-				if (this.settings.useWikiLinks) {
-					return `${bullet} [[${node.name}]]`;
-				}
-				return `${bullet} [${node.name}](${this.getEncodedUri(rootNode, node)})`;
-			}
-			return null;
-		}
-		let text = "";
-		if (!topLevel || this.settings.showEnclosingNote) {
-			// Print the folder name
-			text = `${bullet} **${node.name}**`;
-			let folderNote;
-			if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-				folderNote = this.app.vault.getAbstractFileByPath(node.path + "/" + node.name + ".md");
-			} else if (node.parent) {
-				folderNote = this.app.vault.getAbstractFileByPath(node.parent.path + "/" + node.name + ".md");
-			}
-			if (folderNote instanceof TFile) {
-				const fmTitle: string | undefined = this.getTitleFromFrontMatter(folderNote);
-				if (this.settings.useWikiLinks) {
-					if (fmTitle) {
-						text = `${bullet} **[[${folderNote.basename}|${fmTitle}]]**`;
-					} else {
-						text = `${bullet} **[[${folderNote.basename}]]**`;
-					}
-				} else {
-					if (fmTitle) {
-						text = `${bullet} **[${fmTitle}](${this.getEncodedUri(rootNode, folderNote)})**`;
-					} else {
-						text = `${bullet} **[${folderNote.basename}](${this.getEncodedUri(rootNode, folderNote)})**`;
-					}
-				}
-				if (!topLevel) {
-					if (this.settings.stopScanAtFolderNotes) {
-						return text;
-					}
-					const content = await this.app.vault.cachedRead(folderNote);
-					if (content.includes(Waypoint.BEGIN_WAYPOINT) || content.includes(this.settings.waypointFlag)) {
-						return text;
-					}
-				}
-			}
-		}
-		if (!node.children || node.children.length == 0) {
-			return `${bullet} **${node.name}**`;
-		}
-		// Print the files and nested folders within the folder
-		let children = node.children;
-		children = children.sort((a, b) => {
-			return a.name.localeCompare(b.name, undefined, {
-				numeric: true,
-				sensitivity: "base",
-			});
-		});
-		if (!this.settings.showFolderNotes) {
-			if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-				children = children.filter((child) => (this.settings.showFolderNotes || child.name !== node.name + ".md") && !this.ignorePath(child.path));
-			} else {
-				const folderNames = new Set();
-				for (const element of children) {
-					if (element instanceof TFolder) {
-						folderNames.add(element.name + ".md");
-					}
-				}
-				children = children.filter((child) => (child instanceof TFolder || !folderNames.has(child.name)) && !this.ignorePath(child.path));
-			}
-		}
-		if (children.length > 0) {
-			const nextIndentLevel = topLevel && !this.settings.showEnclosingNote ? indentLevel : indentLevel + 1;
-
-			if (this.settings.foldersOnTop) {
-				children.sort((x, y) => {
-					if (x instanceof TFolder
-						&& !(y instanceof TFolder)) return -1;
-					else return 1;
-				});
-			}
-
-			text += (text === "" ? "" : "\n") + (await Promise.all(children.map((child) => this.getFileTreeRepresentation(rootNode, child, nextIndentLevel)))).filter(Boolean).join("\n");
-		}
-		return text;
-	}
-
-	/**
-	 * Generate an encoded URI path to the given file that is relative to the given root.
-	 * @param rootNode The from which the relative path will be generated
-	 * @param node The node to which the path will be generated
-	 * @returns The encoded path
-	 */
-	getEncodedUri(rootNode: TFolder, node: TAbstractFile) {
-		if (rootNode.isRoot()) {
-			return `./${encodeURI(node.path)}`;
-		}
-		return `./${encodeURI(node.path.substring(rootNode.path.length + 1))}`;
-	}
-
-	ignorePath(path: string): boolean {
-		let found = false;
-		this.settings.ignorePaths.forEach((comparePath) => {
-			if (comparePath === "") {
-				// Ignore empty paths (occurs when the setting value is empty)
-				return;
-			}
-			const regex = new RegExp(comparePath);
-			if (path.match(regex)) {
-				this.log(`Ignoring path: ${path}`);
-				found = true;
-			}
-		});
-		if (found) {
-			return true;
-		}
+	private isIncludedFile(file: TFile): boolean {
+		if (file.extension === "md") return true;
+		if (file.extension === "pdf" && this.config.includePdf) return true;
 		return false;
 	}
 
-	/**
-	 * Scan the changed folders and their ancestors for waypoints and update them if found.
-	 */
-	updateChangedFolders = async () => {
-		this.log("Updating changed folders...");
-		this.foldersWithChanges.forEach((folder) => {
-			this.log("Updating " + folder.path);
-			this.updateParentPoint(folder, true);
-		});
-		this.foldersWithChanges.clear();
-	};
+	private buildFolderLines(folder: TFolder, lines: string[], indentLevel: number, isRoot: boolean): void {
+		if (!folder.children || folder.children.length === 0) return;
 
-	/**
-	 * Schedule an update for the changed folders after debouncing to prevent excessive updates.
-	 */
-	scheduleUpdate = debounce(this.updateChangedFolders.bind(this), 500, true);
+		const children = this.sortChildren(folder.children.filter((child) => !this.shouldIgnore(child)));
 
-	/**
-	 * Update the ancestor waypoint (if any) of the given file/folder.
-	 * @param node The node to start the search from
-	 * @param includeCurrentNode Whether to include the given folder in the search
-	 */
-	updateParentPoint = async (node: TAbstractFile, includeCurrentNode: boolean) => {
-		const [parentFlag, parentPoint] = await this.locateParentPoint(node, includeCurrentNode);
-		if (parentPoint === null) {
-			return;
-		}
-		this.updateWaypoint(parentPoint, parentFlag);
-		this.updateParentPoint(parentPoint.parent, false);
-	};
-
-	/**
-	 * Locate the ancestor waypoint (if any) of the given file/folder.
-	 * @param node The node to start the search from
-	 * @param includeCurrentNode Whether to include the given folder in the search
-	 * @returns The ancestor waypoint, or null if none was found
-	 */
-	async locateParentPoint(node: TAbstractFile, includeCurrentNode: boolean): Promise<[WaypointType, TFile]> {
-		this.log("Locating parent flag and file of " + node.name);
-		let folder = includeCurrentNode ? node : node.parent;
-		while (folder) {
-			let folderNote;
-			if (this.settings.folderNoteType === FolderNoteType.InsideFolder) {
-				folderNote = this.app.vault.getAbstractFileByPath(folder.path + "/" + folder.name + ".md");
-			} else if (this.settings.folderNoteType === FolderNoteType.CustomFilename) {
-				folderNote = this.app.vault.getAbstractFileByPath(folder.path + "/" + this.settings.folderNoteFilename + ".md");
-			} else {
-				if (folder.parent) {
-					folderNote = this.app.vault.getAbstractFileByPath(this.getCleanParentPath(folder) + folder.name + ".md");
-				}
+		for (const child of children) {
+			if (child instanceof TFolder) {
+				this.buildSubfolderLines(child, lines, indentLevel);
+			} else if (child instanceof TFile) {
+				if (this.isFolderNote(child, folder)) continue;
+				if (!this.isIncludedFile(child)) continue;
+				this.buildFileLines(child, lines, indentLevel);
 			}
-			if (folderNote instanceof TFile) {
-				this.log("Found folder note: " + folderNote.path);
-				const text = await this.app.vault.cachedRead(folderNote);
-				if (text.includes(Waypoint.BEGIN_WAYPOINT) || text.includes(this.settings.waypointFlag)) {
-					this.log("Found parent waypoint!");
-					return [WaypointType.Waypoint, folderNote];
-				}
-				if (text.includes(Waypoint.BEGIN_LANDMARK) || text.includes(this.settings.landmarkFlag)) {
-					this.log("Found parent landmark!");
-					return [WaypointType.Landmark, folderNote];
-				}
-			}
-			folder = folder.parent;
 		}
-		this.log("No parent flag found.");
-		return [null, null];
 	}
 
-	/**
-	 * Get the parent folder of the given filepath if it exists.
-	 * @param path The filepath to search
-	 * @returns The parent folder, or null if none exists
-	 */
-	getParentFolder(path: string): TFolder {
-		const abstractFile = this.app.vault.getAbstractFileByPath(path.split("/").slice(0, -1).join("/"));
-		if (abstractFile instanceof TFolder) {
-			return abstractFile;
+	private buildSubfolderLines(folder: TFolder, lines: string[], indentLevel: number): void {
+		const indent = "\t".repeat(indentLevel);
+		const folderNote = this.getFolderNote(folder);
+
+		if (folderNote) {
+			const displayName = this.getDisplayName(folderNote);
+			if (this.plugin.settings.useWikiLinks) {
+				lines.push(`${indent}- **[[${folderNote.basename}|${displayName}]]**`);
+			} else {
+				lines.push(`${indent}- **[${displayName}](${folderNote.path})**`);
+			}
+		} else {
+			lines.push(`${indent}- **${folder.name}**`);
+		}
+
+		this.buildFolderLines(folder, lines, indentLevel + 1, false);
+	}
+
+	private buildFileLines(file: TFile, lines: string[], indentLevel: number): void {
+		const indent = "\t".repeat(indentLevel);
+		const displayName = this.getDisplayName(file);
+		const isMd = file.extension === "md";
+		const linkName = isMd ? file.basename : file.name;
+
+		if (this.plugin.settings.useWikiLinks) {
+			if (displayName !== file.basename) {
+				lines.push(`${indent}- [[${linkName}|${displayName}]]`);
+			} else {
+				lines.push(`${indent}- [[${linkName}]]`);
+			}
+		} else {
+			lines.push(`${indent}- [${displayName}](${file.path})`);
+		}
+
+		if (!isMd) return;
+
+		const headings = this.app.metadataCache.getFileCache(file)?.headings;
+		if (headings && headings.length > 0) {
+			const headingTree = buildHeadingTree(headings, this.config.headingDepth);
+			this.buildHeadingLines(headingTree, lines, indentLevel + 1, file);
+		}
+	}
+
+	private buildHeadingLines(nodes: HeadingNode[], lines: string[], indentLevel: number, file: TFile): void {
+		const indent = "\t".repeat(indentLevel);
+		for (const node of nodes) {
+			if (this.plugin.settings.useWikiLinks) {
+				lines.push(`${indent}- ${node.text} [[${file.basename}#${node.text}|↗]]`);
+			} else {
+				lines.push(`${indent}- ${node.text} [↗](${file.path}#${encodeURIComponent(node.text)})`);
+			}
+			if (node.children.length > 0) {
+				this.buildHeadingLines(node.children, lines, indentLevel + 1, file);
+			}
+		}
+	}
+
+	private resolveFolder(): TFolder | null {
+		if (this.config.path) {
+			const abstract = this.app.vault.getAbstractFileByPath(this.config.path);
+			return abstract instanceof TFolder ? abstract : null;
+		}
+		const sourceFile = this.app.vault.getAbstractFileByPath(this.sourcePath);
+		if (sourceFile) {
+			return sourceFile.parent;
 		}
 		return null;
 	}
 
-	log(message: string) {
-		if (this.settings.debugLogging) {
-			console.log(message);
+	private shouldIgnore(node: TAbstractFile): boolean {
+		return this.config.ignore.some((name) => node.name === name);
+	}
+
+	private sortChildren(children: TAbstractFile[]): TAbstractFile[] {
+		const sorted = [...children].sort((a, b) =>
+			a.name.localeCompare(b.name, undefined, {
+				numeric: true,
+				sensitivity: "base",
+			}),
+		);
+
+		if (this.plugin.settings.foldersOnTop) {
+			sorted.sort((a, b) => {
+				if (a instanceof TFolder && !(b instanceof TFolder)) return -1;
+				if (!(a instanceof TFolder) && b instanceof TFolder) return 1;
+				return 0;
+			});
 		}
+
+		return sorted;
+	}
+
+	private isFolderNote(file: TFile, folder: TFolder): boolean {
+		const type = this.plugin.settings.folderNoteType;
+		if (type === FolderNoteType.InsideFolder) {
+			return file.basename === folder.name;
+		}
+		if (type === FolderNoteType.CustomFilename) {
+			return file.basename === this.plugin.settings.folderNoteFilename;
+		}
+		return false;
+	}
+
+	private getFolderNote(folder: TFolder): TFile | null {
+		const type = this.plugin.settings.folderNoteType;
+		let path: string;
+		if (type === FolderNoteType.InsideFolder) {
+			path = folder.path + "/" + folder.name + ".md";
+		} else if (type === FolderNoteType.CustomFilename) {
+			path = folder.path + "/" + this.plugin.settings.folderNoteFilename + ".md";
+		} else if (type === FolderNoteType.OutsideFolder && folder.parent) {
+			const parentPath = folder.parent.isRoot() ? "" : folder.parent.path + "/";
+			path = parentPath + folder.name + ".md";
+		} else {
+			return null;
+		}
+		const file = this.app.vault.getAbstractFileByPath(path);
+		return file instanceof TFile ? file : null;
+	}
+
+	private getDisplayName(file: TFile): string {
+		if (this.plugin.settings.useFrontMatterTitle) {
+			const fm = this.app.metadataCache?.getFileCache(file)?.frontmatter;
+			if (fm?.hasOwnProperty("title") && typeof fm.title === "string") {
+				return fm.title;
+			}
+		}
+		return file.basename;
+	}
+}
+
+export default class FolderTocPlugin extends Plugin {
+	settings: FolderTocSettings;
+
+	async onload() {
+		await this.loadSettings();
+
+		this.registerMarkdownCodeBlockProcessor("folder-toc", (source, el, ctx) => {
+			const renderer = new FolderTocRenderer(el, source, this.app, this, ctx.sourcePath, ctx);
+			ctx.addChild(renderer);
+		});
+
+		this.addCommand({
+			id: "refresh-folder-toc",
+			name: "Refresh Folder TOC in current file",
+			callback: async () => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file) return;
+				await this.refreshTocInFile(file);
+			},
+		});
+
+		this.addSettingTab(new FolderTocSettingsTab(this.app, this));
+	}
+
+	onunload() {}
+
+	async refreshTocInFile(file: TFile) {
+		const text = await this.app.vault.read(file);
+		const lines = text.split("\n");
+		let changed = false;
+
+		// Find all folder-toc code blocks and their associated markers
+		let i = 0;
+		while (i < lines.length) {
+			// Look for ```folder-toc
+			const trimmed = lines[i].trim();
+			if (trimmed.startsWith("```folder-toc")) {
+				const codeBlockStart = i;
+				i++;
+				// Read config lines until closing ```
+				let configSource = "";
+				while (i < lines.length && lines[i].trim() !== "```") {
+					configSource += lines[i] + "\n";
+					i++;
+				}
+				if (i >= lines.length) break;
+				const codeBlockEnd = i;
+				i++;
+
+				const config = parseConfig(configSource, this.settings);
+				const folder = this.resolveFolder(config, file);
+				if (!folder) continue;
+
+				const tocContent = this.buildMarkdownForFolder(folder, config, file);
+				const newBlock = `${BEGIN_MARKER}\n${tocContent}\n${END_MARKER}`;
+
+				// Check for existing markers after code block
+				let markerStart = -1;
+				let markerEnd = -1;
+				for (let j = codeBlockEnd + 1; j < lines.length; j++) {
+					const t = lines[j].trim();
+					if (markerStart === -1) {
+						if (t === "") continue;
+						if (t === BEGIN_MARKER) {
+							markerStart = j;
+							continue;
+						}
+						break;
+					}
+					if (t === END_MARKER) {
+						markerEnd = j;
+						break;
+					}
+				}
+
+				if (markerStart !== -1 && markerEnd !== -1) {
+					lines.splice(markerStart, markerEnd - markerStart + 1, newBlock);
+					changed = true;
+				} else {
+					lines.splice(codeBlockEnd + 1, 0, "", newBlock);
+					changed = true;
+				}
+			}
+			i++;
+		}
+
+		if (changed) {
+			await this.app.vault.modify(file, lines.join("\n"));
+		}
+	}
+
+	private resolveFolder(config: FolderTocConfig, file: TFile): TFolder | null {
+		if (config.path) {
+			const abstract = this.app.vault.getAbstractFileByPath(config.path);
+			return abstract instanceof TFolder ? abstract : null;
+		}
+		return file.parent;
+	}
+
+	private buildMarkdownForFolder(folder: TFolder, config: FolderTocConfig, file: TFile): string {
+		const builder = new TocBuilder(this.app, this, config);
+		return builder.build(folder);
 	}
 
 	async loadSettings() {
@@ -558,10 +447,165 @@ export default class Waypoint extends Plugin {
 	}
 }
 
-class WaypointSettingsTab extends PluginSettingTab {
-	plugin: Waypoint;
+class TocBuilder {
+	constructor(
+		private app: App,
+		private plugin: FolderTocPlugin,
+		private config: FolderTocConfig,
+	) {}
 
-	constructor(app: App, plugin: Waypoint) {
+	build(folder: TFolder): string {
+		const lines: string[] = [];
+		lines.push(`**${folder.name}**`);
+		this.buildFolderLines(folder, lines, 0, true);
+		return lines.join("\n");
+	}
+
+	private isIncludedFile(file: TFile): boolean {
+		if (file.extension === "md") return true;
+		if (file.extension === "pdf" && this.config.includePdf) return true;
+		return false;
+	}
+
+	private buildFolderLines(folder: TFolder, lines: string[], indentLevel: number, isRoot: boolean): void {
+		if (!folder.children || folder.children.length === 0) return;
+
+		const children = this.sortChildren(folder.children.filter((child) => !this.shouldIgnore(child)));
+
+		for (const child of children) {
+			if (child instanceof TFolder) {
+				this.buildSubfolderLines(child, lines, indentLevel);
+			} else if (child instanceof TFile) {
+				if (this.isFolderNote(child, folder)) continue;
+				if (!this.isIncludedFile(child)) continue;
+				this.buildFileLines(child, lines, indentLevel);
+			}
+		}
+	}
+
+	private buildSubfolderLines(folder: TFolder, lines: string[], indentLevel: number): void {
+		const indent = "\t".repeat(indentLevel);
+		const folderNote = this.getFolderNote(folder);
+
+		if (folderNote) {
+			const displayName = this.getDisplayName(folderNote);
+			if (this.plugin.settings.useWikiLinks) {
+				lines.push(`${indent}- **[[${folderNote.basename}|${displayName}]]**`);
+			} else {
+				lines.push(`${indent}- **[${displayName}](${folderNote.path})**`);
+			}
+		} else {
+			lines.push(`${indent}- **${folder.name}**`);
+		}
+
+		this.buildFolderLines(folder, lines, indentLevel + 1, false);
+	}
+
+	private buildFileLines(file: TFile, lines: string[], indentLevel: number): void {
+		const indent = "\t".repeat(indentLevel);
+		const displayName = this.getDisplayName(file);
+		const isMd = file.extension === "md";
+		const linkName = isMd ? file.basename : file.name;
+
+		if (this.plugin.settings.useWikiLinks) {
+			if (displayName !== file.basename) {
+				lines.push(`${indent}- [[${linkName}|${displayName}]]`);
+			} else {
+				lines.push(`${indent}- [[${linkName}]]`);
+			}
+		} else {
+			lines.push(`${indent}- [${displayName}](${file.path})`);
+		}
+
+		if (!isMd) return;
+
+		const headings = this.app.metadataCache.getFileCache(file)?.headings;
+		if (headings && headings.length > 0) {
+			const headingTree = buildHeadingTree(headings, this.config.headingDepth);
+			this.buildHeadingLines(headingTree, lines, indentLevel + 1, file);
+		}
+	}
+
+	private buildHeadingLines(nodes: HeadingNode[], lines: string[], indentLevel: number, file: TFile): void {
+		const indent = "\t".repeat(indentLevel);
+		for (const node of nodes) {
+			if (this.plugin.settings.useWikiLinks) {
+				lines.push(`${indent}- ${node.text} [[${file.basename}#${node.text}|↗]]`);
+			} else {
+				lines.push(`${indent}- ${node.text} [↗](${file.path}#${encodeURIComponent(node.text)})`);
+			}
+			if (node.children.length > 0) {
+				this.buildHeadingLines(node.children, lines, indentLevel + 1, file);
+			}
+		}
+	}
+
+	private shouldIgnore(node: TAbstractFile): boolean {
+		return this.config.ignore.some((name) => node.name === name);
+	}
+
+	private sortChildren(children: TAbstractFile[]): TAbstractFile[] {
+		const sorted = [...children].sort((a, b) =>
+			a.name.localeCompare(b.name, undefined, {
+				numeric: true,
+				sensitivity: "base",
+			}),
+		);
+
+		if (this.plugin.settings.foldersOnTop) {
+			sorted.sort((a, b) => {
+				if (a instanceof TFolder && !(b instanceof TFolder)) return -1;
+				if (!(a instanceof TFolder) && b instanceof TFolder) return 1;
+				return 0;
+			});
+		}
+
+		return sorted;
+	}
+
+	private isFolderNote(file: TFile, folder: TFolder): boolean {
+		const type = this.plugin.settings.folderNoteType;
+		if (type === FolderNoteType.InsideFolder) {
+			return file.basename === folder.name;
+		}
+		if (type === FolderNoteType.CustomFilename) {
+			return file.basename === this.plugin.settings.folderNoteFilename;
+		}
+		return false;
+	}
+
+	private getFolderNote(folder: TFolder): TFile | null {
+		const type = this.plugin.settings.folderNoteType;
+		let path: string;
+		if (type === FolderNoteType.InsideFolder) {
+			path = folder.path + "/" + folder.name + ".md";
+		} else if (type === FolderNoteType.CustomFilename) {
+			path = folder.path + "/" + this.plugin.settings.folderNoteFilename + ".md";
+		} else if (type === FolderNoteType.OutsideFolder && folder.parent) {
+			const parentPath = folder.parent.isRoot() ? "" : folder.parent.path + "/";
+			path = parentPath + folder.name + ".md";
+		} else {
+			return null;
+		}
+		const file = this.app.vault.getAbstractFileByPath(path);
+		return file instanceof TFile ? file : null;
+	}
+
+	private getDisplayName(file: TFile): string {
+		if (this.plugin.settings.useFrontMatterTitle) {
+			const fm = this.app.metadataCache?.getFileCache(file)?.frontmatter;
+			if (fm?.hasOwnProperty("title") && typeof fm.title === "string") {
+				return fm.title;
+			}
+		}
+		return file.basename;
+	}
+}
+
+class FolderTocSettingsTab extends PluginSettingTab {
+	plugin: FolderTocPlugin;
+
+	constructor(app: App, plugin: FolderTocPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -569,202 +613,71 @@ class WaypointSettingsTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		containerEl.createEl('h2', { text: "Waypoint Settings" });
-		new Setting(this.containerEl)
+		containerEl.createEl("h2", { text: "Folder TOC Settings" });
+
+		new Setting(containerEl)
 			.setName("Folder Note Style")
 			.setDesc("Select the style of folder note used.")
-			.addDropdown((dropdown) => dropdown
-				.addOption(FolderNoteType.InsideFolder, "Folder Name Inside")
-				.addOption(FolderNoteType.OutsideFolder, "Folder Name Outside")
-				.addOption(FolderNoteType.CustomFilename, "Custom Filename")
-				.setValue(this.plugin.settings.folderNoteType)
-				.onChange(async (value) => {
-					this.plugin.settings.folderNoteType = value;
-					await this.plugin.saveSettings();
-				})
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption(FolderNoteType.InsideFolder, "Folder Name Inside")
+					.addOption(FolderNoteType.OutsideFolder, "Folder Name Outside")
+					.addOption(FolderNoteType.CustomFilename, "Custom Filename")
+					.setValue(this.plugin.settings.folderNoteType)
+					.onChange(async (value) => {
+						this.plugin.settings.folderNoteType = value as FolderNoteType;
+						await this.plugin.saveSettings();
+					}),
 			);
-		// new Setting(containerEl)
-		// 	.setName("Debug Plugin")
-		// 	.setDesc("If enabled, the plugin will create extensive logs.")
-		// 	.addToggle((toggle) =>
-		// 		toggle
-		// 			.setValue(this.plugin.settings.debugLogging)
-		// 			.onChange(async (value) => {
-		// 				this.plugin.settings.debugLogging = value;
-		// 				await this.plugin.saveSettings();
-		// 			})
-		// 	);
+
 		new Setting(containerEl)
-			.setName("Show Folder Notes")
-			.setDesc("If enabled, folder notes will be listed alongside other notes in the generated waypoints.")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.showFolderNotes).onChange(async (value) => {
-					this.plugin.settings.showFolderNotes = value;
+			.setName("Custom Folder Note Filename")
+			.setDesc("The filename of the folder note. Only used if the folder note style is set to Custom Filename.")
+			.addText((text) =>
+				text.setValue(this.plugin.settings.folderNoteFilename).onChange(async (value) => {
+					this.plugin.settings.folderNoteFilename = value;
 					await this.plugin.saveSettings();
-				})
+				}),
 			);
-		new Setting(containerEl)
-			.setName("Show Non-Markdown Files")
-			.setDesc("If enabled, non-Markdown files will be listed alongside other notes in the generated waypoints.")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.showNonMarkdownFiles).onChange(async (value) => {
-					this.plugin.settings.showNonMarkdownFiles = value;
-					await this.plugin.saveSettings();
-				})
-			);
-		new Setting(containerEl)
-			.setName("Show Enclosing Note")
-			.setDesc("If enabled, the name of the folder note containing the waypoint will be listed at the top of the generated waypoints.")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.showEnclosingNote).onChange(async (value) => {
-					this.plugin.settings.showEnclosingNote = value;
-					await this.plugin.saveSettings();
-				})
-			);
-		new Setting(containerEl)
-			.setName("Folders on Top")
-			.setDesc("If enabled, folders will be listed at the top in the generated waypoints.")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.foldersOnTop).onChange(async (value) => {
-					this.plugin.settings.foldersOnTop = value;
-					await this.plugin.saveSettings();
-				})
-			);
-		new Setting(containerEl)
-			.setName("Stop Scan at Folder Notes")
-			.setDesc("If enabled, the waypoint generator will stop scanning nested folders when it encounters a folder note. Otherwise, it will only stop if the folder note contains a waypoint.")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.stopScanAtFolderNotes).onChange(async (value) => {
-					this.plugin.settings.stopScanAtFolderNotes = value;
-					await this.plugin.saveSettings();
-				})
-			);
+
 		new Setting(containerEl)
 			.setName("Use WikiLinks")
-			.setDesc("If enabled, links will be generated like [[My Page]] instead of [My Page](../Folder/My%Page.md).")
+			.setDesc("If enabled, internal links will use [[WikiLink]] style. Otherwise, standard Markdown links.")
 			.addToggle((toggle) =>
 				toggle.setValue(this.plugin.settings.useWikiLinks).onChange(async (value) => {
 					this.plugin.settings.useWikiLinks = value;
 					await this.plugin.saveSettings();
-				})
+				}),
 			);
+
 		new Setting(containerEl)
 			.setName("Use Title Property")
-			.setDesc("If enabled, links will use the \"title\" frontmatter property for the displayed text (if it exists).")
+			.setDesc('If enabled, links will use the "title" frontmatter property for the displayed text (if it exists).')
 			.addToggle((toggle) =>
 				toggle.setValue(this.plugin.settings.useFrontMatterTitle).onChange(async (value) => {
 					this.plugin.settings.useFrontMatterTitle = value;
 					await this.plugin.saveSettings();
-				})
+				}),
 			);
-		new Setting(containerEl)
-			.setName("Use Spaces for Indentation")
-			.setDesc("If enabled, the waypoint list will be indented with spaces rather than with tabs.")
-			.addToggle((toggle: ToggleComponent) =>
-				toggle.setValue(this.plugin.settings.useSpaces).onChange(async (value: boolean) => {
-					this.plugin.settings.useSpaces = value;
-					await this.plugin.saveSettings();
-				})
-			);
-		// TODO: Determine if there is a number component that can be used here instead
-		new Setting(containerEl)
-			.setName("Number of Spaces for Indentation")
-			.setDesc("If spaces are used for indentation, this is the number of spaces that will be used per indentation level.")
-			.addText((text: TextComponent) =>
-				text
-					.setPlaceholder("2")
-					.setValue("" + this.plugin.settings.numSpaces)
-					.onChange(async (value: string) => {
-						const num = parseInt(value, 10);
-						if (isNaN(num)) return;
-						this.plugin.settings.numSpaces = num;
-						await this.plugin.saveSettings();
-					})
-			);
-		new Setting(containerEl)
-			.setName("Waypoint Flag")
-			.setDesc("Text flag that triggers waypoint generation in a folder note. Must be surrounded by double-percent signs.")
-			.addText((text) =>
-				text
-					.setPlaceholder(DEFAULT_SETTINGS.waypointFlag)
-					.setValue(this.plugin.settings.waypointFlag)
-					.onChange(async (value) => {
-						if (value && value.startsWith("%%") && value.endsWith("%%") && value !== "%%" && value !== "%%%" && value !== "%%%%") {
-							this.plugin.settings.waypointFlag = value;
-						} else {
-							this.plugin.settings.waypointFlag = DEFAULT_SETTINGS.waypointFlag;
-							console.error("Error: Waypoint flag must be surrounded by double-percent signs.");
-						}
-						await this.plugin.saveSettings();
-					})
-			);
-		new Setting(containerEl)
-			.setName("Landmark Flag")
-			.setDesc("Text flag that triggers landmark generation in a folder note. Must be surrounded by double-percent signs.")
-			.addText((text) =>
-				text
-					.setPlaceholder(DEFAULT_SETTINGS.landmarkFlag)
-					.setValue(this.plugin.settings.landmarkFlag)
-					.onChange(async (value) => {
-						if (value && value.startsWith("%%") && value.endsWith("%%") && value !== "%%" && value !== "%%%" && value !== "%%%%") {
-							this.plugin.settings.landmarkFlag = value;
-						} else {
-							this.plugin.settings.landmarkFlag = DEFAULT_SETTINGS.landmarkFlag;
-							console.error("Error: Landmark flag must be surrounded by double-percent signs.");
-						}
-						await this.plugin.saveSettings();
-					})
-			);
-		new Setting(containerEl)
-			.setName("Ignored Files/Folders")
-			.setDesc("Regex list of files or folders to ignore while making indices. Enter only one regex per line.")
-			.addTextArea((text) =>
-				text
-					.setPlaceholder(DEFAULT_SETTINGS.ignorePaths.join("\n"))
-					.setValue(this.plugin.settings.ignorePaths.join("\n"))
-					.onChange(async (value) => {
-						const paths = value
-							.trim()
-							.split("\n")
-							.map((value) => this.getNormalizedPath(value));
-						this.plugin.settings.ignorePaths = paths;
-						await this.plugin.saveSettings();
-					})
-			);
-		new Setting(containerEl)
-			.setName("Custom Folder Note Filename")
-			.setDesc("The filename of the folder note. Only used if the folder note style is set to Custom Filename.")
-			.addText(text => text
-				.setValue(this.plugin.settings.folderNoteFilename)
-				.onChange(async (value) => {
-					this.plugin.settings.folderNoteFilename = value;
-					await this.plugin.saveSettings();
-				})
-			);
-		const postscriptElement = containerEl.createEl("div", {
-			cls: "setting-item",
-		});
-		const descriptionElement = postscriptElement.createDiv({
-			cls: "setting-item-description",
-		});
-		descriptionElement.createSpan({
-			text: "For instructions on how to use this plugin, check out the README on ",
-		});
-		descriptionElement.createEl("a", {
-			attr: { href: "https://github.com/IdreesInc/Waypoint" },
-			text: "GitHub",
-		});
-		descriptionElement.createSpan({
-			text: " or get in touch with the author ",
-		});
-		descriptionElement.createEl("a", {
-			attr: { href: "https://github.com/IdreesInc" },
-			text: "@IdreesInc",
-		});
-		postscriptElement.appendChild(descriptionElement);
-	}
 
-	getNormalizedPath(path: string): string {
-		return path.length == 0 ? path : normalizePath(path);
+		new Setting(containerEl)
+			.setName("Folders on Top")
+			.setDesc("If enabled, folders will be listed before files in the generated tree.")
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.foldersOnTop).onChange(async (value) => {
+					this.plugin.settings.foldersOnTop = value;
+					await this.plugin.saveSettings();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("Include PDF Files")
+			.setDesc("If enabled, PDF files will be included in the generated TOC by default. This can be overridden per code block with \"includePdf: true\" or \"includePdf: false\".")
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.includePdf).onChange(async (value) => {
+					this.plugin.settings.includePdf = value;
+					await this.plugin.saveSettings();
+				}),
+			);
 	}
 }
